@@ -501,13 +501,36 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          Row(
             children: [
-              Text("HRV MONITOR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-              Text("Pro Edition", style: TextStyle(color: Colors.grey, fontSize: 12)),
+              // Logo
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                padding: const EdgeInsets.all(5),
+                child: Image.asset(
+                  'assets/images/logo.png',
+                  fit: BoxFit.contain,
+                ),
+              ),
+              const SizedBox(width: 12),
+
+              // 2. Tên App
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("HRV MONITOR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+                  Text("Pro Edition", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                ],
+              ),
             ],
           ),
+
+          //CAMERA PREVIEW
           Container(
             width: 60,
             height: 60,
@@ -529,7 +552,6 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
       ),
     );
   }
-
   Widget _buildIdleView() {
     return Column(
       mainAxisSize: MainAxisSize.min,
