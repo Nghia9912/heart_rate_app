@@ -9,6 +9,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Lock orientation to portrait to prevent camera stream issues
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
@@ -25,40 +26,44 @@ class HRVProfessionalPage extends StatefulWidget {
 }
 
 class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsBindingObserver {
+  // --- HARDWARE CONTROLLERS ---
   CameraController? _controller;
   bool _isCameraInitialized = false;
 
+  // --- STATE MANAGEMENT ---
   AppState _appState = AppState.idle;
   bool _isScanInProgress = false;
   Timer? _timer;
   int _elapsedSeconds = 0;
-  final int _measurementDuration = 60;
+  final int _measurementDuration = 60; // Standard 60s measurement
   bool _isFingerDetected = false;
 
+  // --- DATA VISUALIZATION ---
   final List<double> _chartData = [];
-  final List<double> _rrIntervalsHighPrecision = []; // Lưu RR interval dạng double (ms) chính xác cao
-  final List<int> _bpmBuffer = [];
+  final List<double> _rrIntervalsHighPrecision = []; // Stores exact ms durations
+  final List<int> _bpmBuffer = []; // Buffer for smoothing UI display
   int _displayBpm = 0;
 
-  // --- SIGNAL PROCESSING VARIABLES ---
+  // --- SIGNAL PROCESSING (DSP) VARIABLES ---
   final List<double> _rawSignalBuffer = [];
   final List<double> _filteredSignal = [];
   final int _bufferSize = 256;
+  final List<double> _maBuffer = []; // Moving Average buffer
 
-  // High-precision timing
+  // High-precision timing for Sub-frame Interpolation
   final Stopwatch _measurementStopwatch = Stopwatch();
-  double? _lastPeakTimestamp; // Thời gian của đỉnh trước (tính bằng ms từ lúc bắt đầu đo)
+  double? _lastPeakTimestamp;
 
-  // Peak Detection Variables
+  // Peak Detection Configuration
   int _framesSinceLastPeak = 0;
-  final int _refractionPeriod = 12;
+  final int _refractionPeriod = 12; // ~400ms refractory period to prevent double counting
   double _signalQuality = 0.0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable();
+    WakelockPlus.enable(); // Prevent screen from sleeping during measurement
     _initializeCamera();
   }
 
@@ -71,6 +76,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     super.dispose();
   }
 
+  // Handle App Lifecycle (Release camera when app is paused)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_controller == null || !_controller!.value.isInitialized) return;
@@ -97,14 +103,16 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
 
     _controller = CameraController(
       selectedCamera,
-      ResolutionPreset.low,
+      ResolutionPreset.low, // 320x240 is optimal for processing speed
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
       await _controller!.initialize();
+      // Flash must be ON (Torch mode) for PPG
       await _controller!.setFlashMode(FlashMode.torch);
+      // Lock Exposure and Focus to prevent auto-adjustment artifacts
       await _controller!.setExposureMode(ExposureMode.locked);
       await _controller!.setFocusMode(FocusMode.locked);
       _controller!.startImageStream(_processImage);
@@ -114,19 +122,20 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
   }
 
-  // Bộ lọc trung bình trượt đơn giản để làm mượt nhiễu hạt
+  // Simple Moving Average (SMA) filter for noise reduction
   double _movingAverage(double newValue, List<double> buffer, int windowSize) {
     buffer.add(newValue);
     if (buffer.length > windowSize) buffer.removeAt(0);
     return buffer.reduce((a, b) => a + b) / buffer.length;
   }
-  final List<double> _maBuffer = [];
 
+  // --- CORE IMAGE PROCESSING LOOP ---
   void _processImage(CameraImage image) {
     if (_isScanInProgress) return;
     _isScanInProgress = true;
 
-    // 1. TÍNH TOÁN ĐỘ SÁNG TRUNG BÌNH (ROI)
+    // 1. EXTRACT ROI (Region of Interest)
+    // We analyze the central 80x80 pixels for luminance changes
     final int width = image.width;
     final int height = image.height;
     final int yStride = image.planes[0].bytesPerRow;
@@ -139,7 +148,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     double sumSquaredDiff = 0.0;
     List<int> pixelSamples = [];
 
-    // Nhảy cóc 2 pixel để tối ưu hiệu năng
+    // Skip every 2nd pixel to optimize CPU usage
     for (int y = centerY - range; y < centerY + range; y += 2) {
       for (int x = centerX - range; x < centerX + range; x += 2) {
         if (y >= 0 && y < height && x >= 0 && x < width) {
@@ -154,14 +163,15 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     if (count == 0) { _isScanInProgress = false; return; }
     double rawAvg = sum / count;
 
-    // 2. PHÁT HIỆN NGÓN TAY (FINGER DETECTION)
+    // 2. FINGER DETECTION
+    // Calculate Standard Deviation to check for uniformity (skin covers lens = low stdDev)
     for (int p in pixelSamples) {
       double diff = p - rawAvg;
       sumSquaredDiff += diff * diff;
     }
     double stdDev = math.sqrt(sumSquaredDiff / count);
 
-    // Ngưỡng phát hiện ngón tay: Sáng vừa phải và đồng nhất
+    // Thresholds: Brightness must be adequate but not overexposed; StdDev must be low
     bool isFingerPresentNow = ((rawAvg > 30 && rawAvg < 255) && stdDev < 30);
 
     if (_isFingerDetected != isFingerPresentNow) {
@@ -174,16 +184,15 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
       return;
     }
 
-    // 3. XỬ LÝ TÍN HIỆU (DSP)
-    // Lưu vào buffer thô
+    // 3. SIGNAL PRE-PROCESSING
     _rawSignalBuffer.add(rawAvg);
     if (_rawSignalBuffer.length > _bufferSize) _rawSignalBuffer.removeAt(0);
     if (_rawSignalBuffer.length < 5) { _isScanInProgress = false; return; }
 
-    // Làm mượt tín hiệu (Smoothing)
+    // Apply Low-pass Filter (Smoothing)
     double smoothed = _movingAverage(rawAvg, _maBuffer, 5);
 
-    // Loại bỏ đường nền (DC Removal) bằng cách trừ đi trung bình của 30 frame trước
+    // Apply DC Removal (Baseline Detrending) using a 30-frame window
     double baseline = smoothed;
     if (_rawSignalBuffer.length > 30) {
       baseline = _rawSignalBuffer.sublist(_rawSignalBuffer.length - 30).reduce((a, b) => a + b) / 30;
@@ -193,7 +202,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     _filteredSignal.add(filtered);
     if (_filteredSignal.length > _bufferSize) _filteredSignal.removeAt(0);
 
-    // Tính chỉ số chất lượng (Signal Quality)
+    // Calculate SQI (Signal Quality Index) for UI feedback
     if (_filteredSignal.length > 60) {
       List<double> recent = _filteredSignal.sublist(_filteredSignal.length - 60);
       double maxVal = recent.reduce((a, b) => a > b ? a : b);
@@ -201,55 +210,51 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
       _signalQuality = math.min(1.0, (maxVal - minVal) / 5.0);
     }
 
-    // 4. THUẬT TOÁN DÒ ĐỈNH + NỘI SUY (PARABOLIC INTERPOLATION)
-    // Cần ít nhất 3 điểm để thực hiện nội suy (Trước, Giữa, Sau)
+    // 4. PEAK DETECTION & SUB-FRAME INTERPOLATION
+    // We need at least 3 points to fit a parabola (Prev, Curr, Next)
     if (_filteredSignal.length >= 3) {
-      double prev = _filteredSignal[_filteredSignal.length - 3]; // y[n-1]
-      double curr = _filteredSignal[_filteredSignal.length - 2]; // y[n]  (Đỉnh tiềm năng)
-      double next = _filteredSignal[_filteredSignal.length - 1]; // y[n+1]
+      double prev = _filteredSignal[_filteredSignal.length - 3];
+      double curr = _filteredSignal[_filteredSignal.length - 2]; // Potential peak
+      double next = _filteredSignal[_filteredSignal.length - 1];
 
-      // Cập nhật ngưỡng động
+      // Dynamic Adaptive Thresholding
       List<double> recent = _filteredSignal.length > 60 ? _filteredSignal.sublist(_filteredSignal.length - 60) : _filteredSignal;
       double minV = recent.reduce(math.min);
       double maxV = recent.reduce(math.max);
-      double threshold = minV + (maxV - minV) * 0.5; // Ngưỡng 50%
+      double threshold = minV + (maxV - minV) * 0.5; // 50% amplitude threshold
 
       _framesSinceLastPeak++;
 
-      // Điều kiện 1: Đây là cực đại cục bộ (Lớn hơn cả 2 bên)
-      // Điều kiện 2: Vượt qua ngưỡng động
-      // Điều kiện 3: Đã qua thời gian trơ (Refraction Period)
+      // Peak Logic: Local Maxima + Above Threshold + Refraction Period
       if (curr > prev && curr > next && curr > threshold && _framesSinceLastPeak > _refractionPeriod) {
 
-        // --- BÍ MẬT CỦA WELLTORY: NỘI SUY PARABOLIC ---
-        // Tìm độ lệch đỉnh (Sub-frame offset)
-        // Công thức: d = (y_prev - y_next) / (2 * (y_prev - 2*y_curr + y_next))
-        // d là khoảng cách từ 'curr' đến đỉnh thực tế (đơn vị: frame)
+        // --- PARABOLIC INTERPOLATION LOGIC ---
+        // Formula to find the exact sub-frame peak offset 'delta'
         double denominator = 2 * (prev - 2 * curr + next);
         double delta = 0.0;
         if (denominator != 0) {
           delta = (prev - next) / denominator;
         }
 
-        // Lấy thời gian hiện tại chính xác bằng Stopwatch
+        // Convert frame index to high-precision timestamp using Stopwatch
         double currentFrameTimeMs = _measurementStopwatch.elapsedMicroseconds / 1000.0;
+        double frameDuration = 33.33; // Approx duration for 30fps
 
-        // Thời điểm thực tế của đỉnh = Thời gian frame hiện tại - 1 frame (do ta đang xét frame giữa) + delta
-        // Giả sử 1 frame ~ 33.33ms
-        double frameDuration = 33.33;
+        // Exact Peak Time = Current Time - 1 frame lag + Delta offset
         double exactPeakTime = currentFrameTimeMs - frameDuration + (delta * frameDuration);
 
         if (_lastPeakTimestamp != null) {
           double rrInterval = exactPeakTime - _lastPeakTimestamp!;
 
-          // Bộ lọc logic: Chỉ nhận nhịp tim 40-160 BPM
+          // Physiologic Filter: Accept only 40-160 BPM (375ms - 1500ms)
           if (rrInterval >= 375 && rrInterval <= 1500) {
 
-            // Outlier Filter (Loại bỏ nhịp nhảy cóc)
+            // Artifact Rejection: Check for sudden jumps compared to average
             bool isValid = true;
             if (_bpmBuffer.isNotEmpty) {
               double avgBpm = _bpmBuffer.reduce((a, b) => a + b) / _bpmBuffer.length;
               double instantBpm = 60000 / rrInterval;
+              // Reject if deviation > 20 BPM
               if ((instantBpm - avgBpm).abs() > 20) isValid = false;
             }
 
@@ -258,29 +263,29 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
                 _rrIntervalsHighPrecision.add(rrInterval);
               }
 
-              // Cập nhật BPM hiển thị (làm tròn để dễ nhìn)
+              // Update Display BPM (Smoothed)
               int instantBpm = (60000 / rrInterval).round();
               _bpmBuffer.add(instantBpm);
-              if (_bpmBuffer.length > 5) _bpmBuffer.removeAt(0); // Chỉ lấy TB 5 nhịp gần nhất cho mượt
+              if (_bpmBuffer.length > 5) _bpmBuffer.removeAt(0);
 
               int displayVal = (_bpmBuffer.reduce((a, b) => a + b) / _bpmBuffer.length).round();
               Future.microtask(() { if (mounted) setState(() => _displayBpm = displayVal); });
 
               _framesSinceLastPeak = 0;
-              _lastPeakTimestamp = exactPeakTime; // Lưu lại mốc thời gian siêu chính xác
+              _lastPeakTimestamp = exactPeakTime;
             }
           } else if (rrInterval > 2000) {
-            // Reset nếu mất tín hiệu quá lâu
+            // Reset logic if signal was lost for > 2 seconds
             _lastPeakTimestamp = exactPeakTime;
             _bpmBuffer.clear();
           }
         } else {
-          _lastPeakTimestamp = exactPeakTime; // Nhịp đầu tiên
+          _lastPeakTimestamp = exactPeakTime; // First peak detected
         }
       }
     }
 
-    // Vẽ biểu đồ (vẫn dùng filtered để vẽ cho mượt mắt)
+    // Update real-time chart
     Future.microtask(() {
       if (mounted) {
         setState(() {
@@ -300,13 +305,13 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     _maBuffer.clear();
   }
 
-  // TÍNH TOÁN HRV VỚI ĐỘ CHÍNH XÁC CAO
+  // --- HRV CALCULATION (TIME DOMAIN & BAEVSKY) ---
   Map<String, double> _calculateHRVMetrics() {
     if (_rrIntervalsHighPrecision.length < 20) {
       return {'sdnn': 0, 'rmssd': 0, 'pnn50': 0, 'mxdmn': 0, 'amo50': 0};
     }
 
-    // 1. Loại bỏ nhiễu bằng phương pháp IQR (Interquartile Range)
+    // 1. Outlier Removal using IQR (Interquartile Range) Method
     List<double> sorted = List.from(_rrIntervalsHighPrecision)..sort();
     int q1Index = sorted.length ~/ 4;
     int q3Index = (sorted.length * 3) ~/ 4;
@@ -317,9 +322,9 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     double upperBound = q3 + 1.5 * iqr;
 
     List<double> cleanedRR = _rrIntervalsHighPrecision.where((rr) => rr >= lowerBound && rr <= upperBound).toList();
-    if (cleanedRR.length < 10) cleanedRR = _rrIntervalsHighPrecision; // Fallback nếu lọc quá tay
+    if (cleanedRR.length < 10) cleanedRR = _rrIntervalsHighPrecision; // Fallback if too aggressive
 
-    // 2. Tính SDNN (Standard Deviation of NN intervals)
+    // 2. SDNN Calculation
     double mean = cleanedRR.reduce((a, b) => a + b) / cleanedRR.length;
     double variance = 0;
     for (var rr in cleanedRR) {
@@ -327,7 +332,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double sdnn = math.sqrt(variance / cleanedRR.length);
 
-    // 3. Tính RMSSD (Root Mean Square of Successive Differences) - Quan trọng nhất cho hồi phục
+    // 3. RMSSD Calculation (Key metric for recovery)
     double sumSquaredDiff = 0;
     for (int i = 1; i < cleanedRR.length; i++) {
       double diff = cleanedRR[i] - cleanedRR[i - 1];
@@ -335,7 +340,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double rmssd = math.sqrt(sumSquaredDiff / (cleanedRR.length - 1));
 
-    // 4. Tính pNN50
+    // 4. pNN50 Calculation
     int count50 = 0;
     for (int i = 1; i < cleanedRR.length; i++) {
       if ((cleanedRR[i] - cleanedRR[i - 1]).abs() > 50) {
@@ -344,7 +349,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double pnn50 = (count50 / (cleanedRR.length - 1)) * 100;
 
-    // 5. Baevsky Metrics
+    // 5. Baevsky Stress Index Metrics
     double maxRR = cleanedRR.reduce(math.max);
     double minRR = cleanedRR.reduce(math.min);
     double mxdmn = maxRR - minRR;
@@ -352,7 +357,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     // AMo50 (Amplitude of Mode)
     Map<int, int> histogram = {};
     for (var rr in cleanedRR) {
-      int bucket = (rr / 50).round() * 50; // Gom nhóm mỗi 50ms
+      int bucket = (rr / 50).round() * 50; // Bin size 50ms
       histogram[bucket] = (histogram[bucket] ?? 0) + 1;
     }
     int maxCount = histogram.values.isEmpty ? 0 : histogram.values.reduce(math.max);
@@ -367,9 +372,9 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     };
   }
 
+  // --- APP CONTROL LOGIC ---
   void _startMeasurement() {
     _timer?.cancel();
-    // Bắt đầu đồng hồ bấm giờ độ phân giải cao
     _measurementStopwatch.reset();
     _measurementStopwatch.start();
 
@@ -423,16 +428,16 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
         context: context,
         builder: (context) => AlertDialog(
           backgroundColor: Colors.grey[800],
-          title: const Text("Dừng đo?", style: TextStyle(color: Colors.white)),
-          content: const Text("Dữ liệu hiện tại sẽ bị mất.", style: TextStyle(color: Colors.white70)),
+          title: const Text("Stop Measurement?", style: TextStyle(color: Colors.white)),
+          content: const Text("Current data will be lost.", style: TextStyle(color: Colors.white70)),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(false),
-              child: const Text("Tiếp tục", style: TextStyle(color: Colors.white)),
+              child: const Text("Continue", style: TextStyle(color: Colors.white)),
             ),
             TextButton(
               onPressed: () => Navigator.of(context).pop(true),
-              child: const Text("Dừng", style: TextStyle(color: Colors.redAccent)),
+              child: const Text("Stop", style: TextStyle(color: Colors.redAccent)),
             ),
           ],
         ),
@@ -448,7 +453,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
   void _copyResults() {
     var metrics = _calculateHRVMetrics();
     String data = """
-HRV REPORT (High Precision)
+HRV REPORT (Clinical Precision)
 Date: ${DateTime.now().toString()}
 Avg BPM: $_displayBpm
 Total Beats: ${_rrIntervalsHighPrecision.length}
@@ -462,10 +467,11 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
     """;
     Clipboard.setData(ClipboardData(text: data));
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Đã sao chép kết quả vào bộ nhớ đệm!")),
+      const SnackBar(content: Text("Results copied to clipboard!")),
     );
   }
 
+  // --- UI BUILDING BLOCKS ---
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -499,7 +505,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text("HRV MONITOR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-              Text("Welltory-Grade Precision", style: TextStyle(color: Colors.grey, fontSize: 12)),
+              Text("Pro Edition", style: TextStyle(color: Colors.grey, fontSize: 12)),
             ],
           ),
           Container(
@@ -533,7 +539,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
         ),
         const SizedBox(height: 20),
         Text(
-            _isFingerDetected ? "Sẵn sàng" : "Đặt ngón tay lên Camera",
+            _isFingerDetected ? "Ready" : "Place Finger on Camera",
             style: TextStyle(
                 color: _isFingerDetected ? Colors.greenAccent : Colors.white70,
                 fontSize: 24,
@@ -548,7 +554,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
             padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 16),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
           ),
-          child: const Text("BẮT ĐẦU ĐO (60s)", style: TextStyle(fontSize: 18, color: Colors.white)),
+          child: const Text("START (60s)", style: TextStyle(fontSize: 18, color: Colors.white)),
         ),
       ],
     );
@@ -568,7 +574,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
               borderRadius: BorderRadius.circular(20)
           ),
           child: Text(
-            _isFingerDetected ? "Tín hiệu Tốt (${(_signalQuality*100).toInt()}%)" : "Mất tín hiệu!",
+            _isFingerDetected ? "Signal: Good (${(_signalQuality*100).toInt()}%)" : "No Signal",
             style: TextStyle(color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent),
           ),
         ),
@@ -584,7 +590,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
           ),
         ),
         const SizedBox(height: 8),
-        Text("${_measurementDuration - _elapsedSeconds}s còn lại",
+        Text("${_measurementDuration - _elapsedSeconds}s remaining",
             style: const TextStyle(color: Colors.white54)
         ),
         const SizedBox(height: 30),
@@ -622,7 +628,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
       child: Column(
         children: [
-          const Text("KẾT QUẢ PHÂN TÍCH",
+          const Text("ANALYSIS REPORT",
               style: TextStyle(color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold)
           ),
           const SizedBox(height: 20),
@@ -634,7 +640,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
             mainAxisSpacing: 10,
             physics: const NeverScrollableScrollPhysics(),
             children: [
-              _buildMetricCard("Nhịp tim TB", "$_displayBpm", "BPM", Colors.redAccent),
+              _buildMetricCard("Avg BPM", "$_displayBpm", "BPM", Colors.redAccent),
               _buildMetricCard("SDNN", metrics['sdnn']!.toStringAsFixed(1), "ms", Colors.blueAccent),
               _buildMetricCard("RMSSD", metrics['rmssd']!.toStringAsFixed(1), "ms", Colors.orangeAccent),
               _buildMetricCard("pNN50", metrics['pnn50']!.toStringAsFixed(1), "%", Colors.purpleAccent),
@@ -643,7 +649,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
             ],
           ),
           const SizedBox(height: 20),
-          Text("Tổng số nhịp: ${_rrIntervalsHighPrecision.length}",
+          Text("Total Beats: ${_rrIntervalsHighPrecision.length}",
               style: const TextStyle(color: Colors.white38)
           ),
           const SizedBox(height: 20),
@@ -653,7 +659,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
               OutlinedButton.icon(
                 onPressed: _resetApp,
                 icon: const Icon(Icons.refresh, color: Colors.white),
-                label: const Text("Đo lại", style: TextStyle(color: Colors.white)),
+                label: const Text("Retry", style: TextStyle(color: Colors.white)),
               ),
               const SizedBox(width: 15),
               ElevatedButton.icon(
