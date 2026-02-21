@@ -9,7 +9,6 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // Lock orientation to portrait to prevent camera stream issues
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
@@ -26,44 +25,42 @@ class HRVProfessionalPage extends StatefulWidget {
 }
 
 class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsBindingObserver {
-  // --- HARDWARE CONTROLLERS ---
+  // --- HARDWARE ---
   CameraController? _controller;
   bool _isCameraInitialized = false;
 
-  // --- STATE MANAGEMENT ---
+  // --- STATE ---
   AppState _appState = AppState.idle;
   bool _isScanInProgress = false;
   Timer? _timer;
   int _elapsedSeconds = 0;
-  final int _measurementDuration = 60; // Standard 60s measurement
+  final int _measurementDuration = 60;
   bool _isFingerDetected = false;
 
-  // --- DATA VISUALIZATION ---
+  // --- DATA ---
   final List<double> _chartData = [];
-  final List<double> _rrIntervalsHighPrecision = []; // Stores exact ms durations
-  final List<int> _bpmBuffer = []; // Buffer for smoothing UI display
+  final List<double> _rrIntervalsHighPrecision = [];
+  final List<int> _bpmBuffer = [];
   int _displayBpm = 0;
 
-  // --- SIGNAL PROCESSING (DSP) VARIABLES ---
+  // --- DSP VARIABLES ---
   final List<double> _rawSignalBuffer = [];
   final List<double> _filteredSignal = [];
   final int _bufferSize = 256;
-  final List<double> _maBuffer = []; // Moving Average buffer
+  final List<double> _maBuffer = [];
 
-  // High-precision timing for Sub-frame Interpolation
+  // Timing & Peaks
   final Stopwatch _measurementStopwatch = Stopwatch();
   double? _lastPeakTimestamp;
-
-  // Peak Detection Configuration
   int _framesSinceLastPeak = 0;
-  final int _refractionPeriod = 12; // ~400ms refractory period to prevent double counting
+  final int _refractionPeriod = 12;
   double _signalQuality = 0.0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable(); // Prevent screen from sleeping during measurement
+    WakelockPlus.enable();
     _initializeCamera();
   }
 
@@ -76,21 +73,27 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     super.dispose();
   }
 
-  // Handle App Lifecycle (Release camera when app is paused)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_controller == null || !_controller!.value.isInitialized) return;
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+      _controller?.setFlashMode(FlashMode.off);
       _controller?.dispose();
-      setState(() {
-        _isCameraInitialized = false;
-        _isFingerDetected = false;
-      });
+      _controller = null;
+
+      if (mounted) {
+        setState(() {
+          _isCameraInitialized = false;
+          _isFingerDetected = false;
+        });
+      }
     } else if (state == AppLifecycleState.resumed) {
-      _initializeCamera();
+      if (_controller == null || !_controller!.value.isInitialized) {
+        _initializeCamera();
+      }
     }
   }
 
+  // --- LOGIC: ORIGINAL SENSOR TRAP (Best Accuracy) ---
   Future<void> _initializeCamera() async {
     await Permission.camera.request();
     final cameras = await availableCameras();
@@ -103,18 +106,36 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
 
     _controller = CameraController(
       selectedCamera,
-      ResolutionPreset.low, // 320x240 is optimal for processing speed
+      ResolutionPreset.low, // Keep low res for performance
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
       await _controller!.initialize();
-      // Flash must be ON (Torch mode) for PPG
-      await _controller!.setFlashMode(FlashMode.torch);
-      // Lock Exposure and Focus to prevent auto-adjustment artifacts
+
+      // 1. Flash OFF
+      await _controller!.setFlashMode(FlashMode.off);
+
+      // 2. Auto Exposure + Max Offset
+      await _controller!.setExposureMode(ExposureMode.auto);
+      try {
+        double maxExposure = await _controller!.getMaxExposureOffset();
+        await _controller!.setExposureOffset(maxExposure);
+      } catch (e) {
+        debugPrint("Exposure Error: $e");
+      }
+
+      // 3. Wait for ISO spike
+      await Future.delayed(const Duration(milliseconds: 50));
+
+      // 4. Lock Settings
       await _controller!.setExposureMode(ExposureMode.locked);
       await _controller!.setFocusMode(FocusMode.locked);
+
+      // 5. Flash ON -> Max Penetration
+      await _controller!.setFlashMode(FlashMode.torch);
+
       _controller!.startImageStream(_processImage);
       if (mounted) setState(() => _isCameraInitialized = true);
     } catch (e) {
@@ -122,20 +143,17 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
   }
 
-  // Simple Moving Average (SMA) filter for noise reduction
   double _movingAverage(double newValue, List<double> buffer, int windowSize) {
     buffer.add(newValue);
     if (buffer.length > windowSize) buffer.removeAt(0);
     return buffer.reduce((a, b) => a + b) / buffer.length;
   }
 
-  // --- CORE IMAGE PROCESSING LOOP ---
+  // --- LOGIC: ORIGINAL DSP LOOP (No Lag) ---
   void _processImage(CameraImage image) {
     if (_isScanInProgress) return;
     _isScanInProgress = true;
 
-    // 1. EXTRACT ROI (Region of Interest)
-    // We analyze the central 80x80 pixels for luminance changes
     final int width = image.width;
     final int height = image.height;
     final int yStride = image.planes[0].bytesPerRow;
@@ -148,7 +166,6 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     double sumSquaredDiff = 0.0;
     List<int> pixelSamples = [];
 
-    // Skip every 2nd pixel to optimize CPU usage
     for (int y = centerY - range; y < centerY + range; y += 2) {
       for (int x = centerX - range; x < centerX + range; x += 2) {
         if (y >= 0 && y < height && x >= 0 && x < width) {
@@ -163,15 +180,12 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     if (count == 0) { _isScanInProgress = false; return; }
     double rawAvg = sum / count;
 
-    // 2. FINGER DETECTION
-    // Calculate Standard Deviation to check for uniformity (skin covers lens = low stdDev)
     for (int p in pixelSamples) {
       double diff = p - rawAvg;
       sumSquaredDiff += diff * diff;
     }
     double stdDev = math.sqrt(sumSquaredDiff / count);
 
-    // Thresholds: Brightness must be adequate but not overexposed; StdDev must be low
     bool isFingerPresentNow = ((rawAvg > 30 && rawAvg < 255) && stdDev < 30);
 
     if (_isFingerDetected != isFingerPresentNow) {
@@ -184,15 +198,12 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
       return;
     }
 
-    // 3. SIGNAL PRE-PROCESSING
     _rawSignalBuffer.add(rawAvg);
     if (_rawSignalBuffer.length > _bufferSize) _rawSignalBuffer.removeAt(0);
     if (_rawSignalBuffer.length < 5) { _isScanInProgress = false; return; }
 
-    // Apply Low-pass Filter (Smoothing)
     double smoothed = _movingAverage(rawAvg, _maBuffer, 5);
 
-    // Apply DC Removal (Baseline Detrending) using a 30-frame window
     double baseline = smoothed;
     if (_rawSignalBuffer.length > 30) {
       baseline = _rawSignalBuffer.sublist(_rawSignalBuffer.length - 30).reduce((a, b) => a + b) / 30;
@@ -202,7 +213,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     _filteredSignal.add(filtered);
     if (_filteredSignal.length > _bufferSize) _filteredSignal.removeAt(0);
 
-    // Calculate SQI (Signal Quality Index) for UI feedback
+    // SQI
     if (_filteredSignal.length > 60) {
       List<double> recent = _filteredSignal.sublist(_filteredSignal.length - 60);
       double maxVal = recent.reduce((a, b) => a > b ? a : b);
@@ -210,51 +221,41 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
       _signalQuality = math.min(1.0, (maxVal - minVal) / 5.0);
     }
 
-    // 4. PEAK DETECTION & SUB-FRAME INTERPOLATION
-    // We need at least 3 points to fit a parabola (Prev, Curr, Next)
+    // Peak Detection & Interpolation
     if (_filteredSignal.length >= 3) {
       double prev = _filteredSignal[_filteredSignal.length - 3];
-      double curr = _filteredSignal[_filteredSignal.length - 2]; // Potential peak
+      double curr = _filteredSignal[_filteredSignal.length - 2];
       double next = _filteredSignal[_filteredSignal.length - 1];
 
-      // Dynamic Adaptive Thresholding
       List<double> recent = _filteredSignal.length > 60 ? _filteredSignal.sublist(_filteredSignal.length - 60) : _filteredSignal;
       double minV = recent.reduce(math.min);
       double maxV = recent.reduce(math.max);
-      double threshold = minV + (maxV - minV) * 0.5; // 50% amplitude threshold
+      double threshold = minV + (maxV - minV) * 0.5;
 
       _framesSinceLastPeak++;
 
-      // Peak Logic: Local Maxima + Above Threshold + Refraction Period
       if (curr > prev && curr > next && curr > threshold && _framesSinceLastPeak > _refractionPeriod) {
 
-        // --- PARABOLIC INTERPOLATION LOGIC ---
-        // Formula to find the exact sub-frame peak offset 'delta'
         double denominator = 2 * (prev - 2 * curr + next);
         double delta = 0.0;
         if (denominator != 0) {
           delta = (prev - next) / denominator;
         }
 
-        // Convert frame index to high-precision timestamp using Stopwatch
         double currentFrameTimeMs = _measurementStopwatch.elapsedMicroseconds / 1000.0;
-        double frameDuration = 33.33; // Approx duration for 30fps
+        double frameDuration = 33.33;
 
-        // Exact Peak Time = Current Time - 1 frame lag + Delta offset
         double exactPeakTime = currentFrameTimeMs - frameDuration + (delta * frameDuration);
 
         if (_lastPeakTimestamp != null) {
           double rrInterval = exactPeakTime - _lastPeakTimestamp!;
 
-          // Physiologic Filter: Accept only 40-160 BPM (375ms - 1500ms)
           if (rrInterval >= 375 && rrInterval <= 1500) {
 
-            // Artifact Rejection: Check for sudden jumps compared to average
             bool isValid = true;
             if (_bpmBuffer.isNotEmpty) {
               double avgBpm = _bpmBuffer.reduce((a, b) => a + b) / _bpmBuffer.length;
               double instantBpm = 60000 / rrInterval;
-              // Reject if deviation > 20 BPM
               if ((instantBpm - avgBpm).abs() > 20) isValid = false;
             }
 
@@ -263,7 +264,6 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
                 _rrIntervalsHighPrecision.add(rrInterval);
               }
 
-              // Update Display BPM (Smoothed)
               int instantBpm = (60000 / rrInterval).round();
               _bpmBuffer.add(instantBpm);
               if (_bpmBuffer.length > 5) _bpmBuffer.removeAt(0);
@@ -275,17 +275,16 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
               _lastPeakTimestamp = exactPeakTime;
             }
           } else if (rrInterval > 2000) {
-            // Reset logic if signal was lost for > 2 seconds
             _lastPeakTimestamp = exactPeakTime;
             _bpmBuffer.clear();
           }
         } else {
-          _lastPeakTimestamp = exactPeakTime; // First peak detected
+          _lastPeakTimestamp = exactPeakTime;
         }
       }
     }
 
-    // Update real-time chart
+    // Chart Update
     Future.microtask(() {
       if (mounted) {
         setState(() {
@@ -305,13 +304,11 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     _maBuffer.clear();
   }
 
-  // --- HRV CALCULATION (TIME DOMAIN & BAEVSKY) ---
   Map<String, double> _calculateHRVMetrics() {
     if (_rrIntervalsHighPrecision.length < 20) {
       return {'sdnn': 0, 'rmssd': 0, 'pnn50': 0, 'mxdmn': 0, 'amo50': 0};
     }
 
-    // 1. Outlier Removal using IQR (Interquartile Range) Method
     List<double> sorted = List.from(_rrIntervalsHighPrecision)..sort();
     int q1Index = sorted.length ~/ 4;
     int q3Index = (sorted.length * 3) ~/ 4;
@@ -322,9 +319,8 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     double upperBound = q3 + 1.5 * iqr;
 
     List<double> cleanedRR = _rrIntervalsHighPrecision.where((rr) => rr >= lowerBound && rr <= upperBound).toList();
-    if (cleanedRR.length < 10) cleanedRR = _rrIntervalsHighPrecision; // Fallback if too aggressive
+    if (cleanedRR.length < 10) cleanedRR = _rrIntervalsHighPrecision;
 
-    // 2. SDNN Calculation
     double mean = cleanedRR.reduce((a, b) => a + b) / cleanedRR.length;
     double variance = 0;
     for (var rr in cleanedRR) {
@@ -332,7 +328,6 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double sdnn = math.sqrt(variance / cleanedRR.length);
 
-    // 3. RMSSD Calculation (Key metric for recovery)
     double sumSquaredDiff = 0;
     for (int i = 1; i < cleanedRR.length; i++) {
       double diff = cleanedRR[i] - cleanedRR[i - 1];
@@ -340,7 +335,6 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double rmssd = math.sqrt(sumSquaredDiff / (cleanedRR.length - 1));
 
-    // 4. pNN50 Calculation
     int count50 = 0;
     for (int i = 1; i < cleanedRR.length; i++) {
       if ((cleanedRR[i] - cleanedRR[i - 1]).abs() > 50) {
@@ -349,15 +343,13 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     }
     double pnn50 = (count50 / (cleanedRR.length - 1)) * 100;
 
-    // 5. Baevsky Stress Index Metrics
     double maxRR = cleanedRR.reduce(math.max);
     double minRR = cleanedRR.reduce(math.min);
     double mxdmn = maxRR - minRR;
 
-    // AMo50 (Amplitude of Mode)
     Map<int, int> histogram = {};
     for (var rr in cleanedRR) {
-      int bucket = (rr / 50).round() * 50; // Bin size 50ms
+      int bucket = (rr / 50).round() * 50;
       histogram[bucket] = (histogram[bucket] ?? 0) + 1;
     }
     int maxCount = histogram.values.isEmpty ? 0 : histogram.values.reduce(math.max);
@@ -372,7 +364,6 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
     };
   }
 
-  // --- APP CONTROL LOGIC ---
   void _startMeasurement() {
     _timer?.cancel();
     _measurementStopwatch.reset();
@@ -471,23 +462,26 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
     );
   }
 
-  // --- UI BUILDING BLOCKS ---
   @override
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
       onPopInvoked: (didPop) { if (!didPop) _handleBackPress(); },
       child: Scaffold(
-        backgroundColor: Colors.grey[900],
+        backgroundColor: const Color(0xFF0a0a0a),
         body: SafeArea(
           child: Column(
             children: [
               _buildHeader(),
-              const Spacer(),
-              if (_appState == AppState.idle) _buildIdleView(),
-              if (_appState == AppState.measuring) _buildMeasuringView(),
-              if (_appState == AppState.result) _buildResultView(),
-              const Spacer(),
+              Expanded(
+                child: Center(
+                  child: _appState == AppState.idle
+                      ? _buildIdleView()
+                      : _appState == AppState.measuring
+                      ? _buildMeasuringView()
+                      : _buildResultView(),
+                ),
+              ),
             ],
           ),
         ),
@@ -495,15 +489,30 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
     );
   }
 
+  // --- UI: PRO INTERFACE WITH GRADIENTS (No Back Button) ---
   Widget _buildHeader() {
-    return Padding(
-      padding: const EdgeInsets.all(16.0),
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.black, Colors.grey[900]!],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.3),
+            blurRadius: 10,
+            offset: const Offset(0, 5),
+          ),
+        ],
+      ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Row(
             children: [
-              // Logo
+              // 1. Logo (No Back Button here)
               Container(
                 width: 40,
                 height: 40,
@@ -518,29 +527,48 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
                 ),
               ),
               const SizedBox(width: 12),
-
-              // 2. Tên App
+              // 2. App Name
               const Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text("HRV MONITOR", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-                  Text("Pro Edition", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  Text(
+                    "HRV MONITOR",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 18,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                  Text(
+                    "Professional Edition",
+                    style: TextStyle(
+                      color: Colors.grey,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w300,
+                    ),
+                  ),
                 ],
               ),
             ],
           ),
-
-          //CAMERA PREVIEW
+          // 3. Camera Preview with Border Animation
           Container(
             width: 60,
             height: 60,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               border: Border.all(
-                  color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
-                  width: 2
+                color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
+                width: 3,
               ),
-              boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 8)],
+              boxShadow: [
+                BoxShadow(
+                  color: (_isFingerDetected ? Colors.greenAccent : Colors.redAccent).withOpacity(0.5),
+                  blurRadius: 10,
+                  spreadRadius: 2,
+                ),
+              ],
             ),
             child: ClipOval(
               child: _isCameraInitialized
@@ -552,31 +580,104 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
       ),
     );
   }
+
   Widget _buildIdleView() {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(Icons.fingerprint, size: 120,
-            color: _isFingerDetected ? Colors.greenAccent : Colors.white24
-        ),
-        const SizedBox(height: 20),
-        Text(
-            _isFingerDetected ? "Ready" : "Place Finger on Camera",
-            style: TextStyle(
-                color: _isFingerDetected ? Colors.greenAccent : Colors.white70,
-                fontSize: 24,
-                fontWeight: FontWeight.bold
-            )
-        ),
-        const SizedBox(height: 40),
-        ElevatedButton(
-          onPressed: _isFingerDetected ? _startMeasurement : null,
-          style: ElevatedButton.styleFrom(
-            backgroundColor: _isFingerDetected ? Colors.redAccent : Colors.grey[800],
-            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 16),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+        Container(
+          padding: const EdgeInsets.all(30),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: _isFingerDetected
+                ? Colors.greenAccent.withOpacity(0.1)
+                : Colors.white.withOpacity(0.05),
+            border: Border.all(
+              color: _isFingerDetected ? Colors.greenAccent : Colors.white24,
+              width: 2,
+            ),
           ),
-          child: const Text("START (60s)", style: TextStyle(fontSize: 18, color: Colors.white)),
+          child: Icon(
+            Icons.fingerprint,
+            size: 100,
+            color: _isFingerDetected ? Colors.greenAccent : Colors.white24,
+          ),
+        ),
+        const SizedBox(height: 30),
+        Text(
+          _isFingerDetected ? "✓ Ready to Start" : "Place Finger on Camera",
+          style: TextStyle(
+            color: _isFingerDetected ? Colors.greenAccent : Colors.white70,
+            fontSize: 22,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.5,
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          _isFingerDetected
+              ? "Cover the camera lens completely"
+              : "Position your finger over the back camera",
+          style: const TextStyle(
+            color: Colors.white38,
+            fontSize: 14,
+          ),
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 50),
+        Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(30),
+            boxShadow: _isFingerDetected
+                ? [
+              BoxShadow(
+                color: Colors.redAccent.withOpacity(0.5),
+                blurRadius: 20,
+                spreadRadius: 2,
+              ),
+            ]
+                : [],
+          ),
+          child: ElevatedButton(
+            onPressed: _isFingerDetected ? _startMeasurement : null,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _isFingerDetected ? Colors.redAccent : Colors.grey[800],
+              padding: const EdgeInsets.symmetric(horizontal: 50, vertical: 18),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+              elevation: _isFingerDetected ? 10 : 2,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  _isFingerDetected ? Icons.play_circle_filled : Icons.play_circle_outline,
+                  color: Colors.white,
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  "START MEASUREMENT",
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 15),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: const Text(
+            "⏱️ Duration: 60 seconds",
+            style: TextStyle(color: Colors.white54, fontSize: 13),
+          ),
         ),
       ],
     );
@@ -586,59 +687,183 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Text("$_displayBpm", style: const TextStyle(color: Colors.white, fontSize: 80, fontWeight: FontWeight.bold)),
-        const Text("BPM", style: TextStyle(color: Colors.redAccent, fontSize: 18, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 20),
+        // 1. Big BPM with Gradient
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
-              color: _isFingerDetected ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(20)
+            gradient: RadialGradient(
+              colors: [
+                Colors.redAccent.withOpacity(0.2),
+                Colors.transparent,
+              ],
+            ),
+            shape: BoxShape.circle,
           ),
-          child: Text(
-            _isFingerDetected ? "Signal: Good (${(_signalQuality*100).toInt()}%)" : "No Signal",
-            style: TextStyle(color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent),
+          child: Column(
+            children: [
+              Text(
+                "$_displayBpm",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 90,
+                  fontWeight: FontWeight.bold,
+                  height: 1,
+                ),
+              ),
+              const Text(
+                "BPM",
+                style: TextStyle(
+                  color: Colors.redAccent,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 3,
+                ),
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 30),
-        SizedBox(
-          width: 250,
-          child: LinearProgressIndicator(
-            value: _elapsedSeconds / _measurementDuration,
-            backgroundColor: Colors.white10,
-            color: _isFingerDetected ? Colors.greenAccent : Colors.red,
-            minHeight: 8,
-            borderRadius: BorderRadius.circular(4),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Text("${_measurementDuration - _elapsedSeconds}s remaining",
-            style: const TextStyle(color: Colors.white54)
-        ),
-        const SizedBox(height: 30),
+
+        // 2. Signal Quality
         Container(
-          height: 100,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: _isFingerDetected
+                ? Colors.green.withOpacity(0.2)
+                : Colors.red.withOpacity(0.2),
+            borderRadius: BorderRadius.circular(25),
+            border: Border.all(
+              color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
+              width: 1.5,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _isFingerDetected ? Icons.check_circle : Icons.error,
+                color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
+                size: 18,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                _isFingerDetected
+                    ? "Signal Quality: ${(_signalQuality * 100).toInt()}%"
+                    : "No Signal Detected",
+                style: TextStyle(
+                  color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 35),
+
+        // 3. Progress Bar
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 40),
+          child: Column(
+            children: [
+              Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: double.infinity,
+                    height: 12,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(6),
+                    child: LinearProgressIndicator(
+                      value: _elapsedSeconds / _measurementDuration,
+                      backgroundColor: Colors.transparent,
+                      color: _isFingerDetected ? Colors.greenAccent : Colors.redAccent,
+                      minHeight: 12,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    "${_elapsedSeconds}s",
+                    style: const TextStyle(color: Colors.white54, fontSize: 13),
+                  ),
+                  Text(
+                    "${_measurementDuration - _elapsedSeconds}s remaining",
+                    style: const TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w500),
+                  ),
+                  Text(
+                    "${_measurementDuration}s",
+                    style: const TextStyle(color: Colors.white54, fontSize: 13),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 35),
+
+        // 4. CHART (Original Simple Logic, but inside New Container UI)
+        Container(
+          height: 120, // Match new UI height
           width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 20),
-          child: _chartData.isNotEmpty ? LineChart(
+          margin: const EdgeInsets.symmetric(horizontal: 20),
+          padding: const EdgeInsets.all(15),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.03),
+            borderRadius: BorderRadius.circular(15),
+            border: Border.all(color: Colors.white.withOpacity(0.1)),
+          ),
+          child: _chartData.isNotEmpty
+              ? LineChart(
             LineChartData(
               gridData: FlGridData(show: false),
               titlesData: FlTitlesData(show: false),
               borderData: FlBorderData(show: false),
               lineBarsData: [
                 LineChartBarData(
-                  spots: _chartData.asMap().entries.map((e) => FlSpot(e.key.toDouble(), e.value)).toList(),
+                  spots: _chartData
+                      .asMap()
+                      .entries
+                      .map((e) => FlSpot(e.key.toDouble(), e.value))
+                      .toList(),
                   isCurved: true,
-                  color: Colors.redAccent.withOpacity(0.8),
+                  color: Colors.redAccent,
                   barWidth: 2,
                   dotData: FlDotData(show: false),
-                  belowBarData: BarAreaData(show: true, color: Colors.redAccent.withOpacity(0.1)),
+                  // Keep the simple Gradient from New UI for better looks, but Data is from Old Logic
+                  belowBarData: BarAreaData(
+                    show: true,
+                    gradient: LinearGradient(
+                      colors: [
+                        Colors.redAccent.withOpacity(0.3),
+                        Colors.redAccent.withOpacity(0.0),
+                      ],
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                    ),
+                  ),
                 ),
               ],
-              minY: _chartData.reduce((a,b)=>a<b?a:b) - 2,
-              maxY: _chartData.reduce((a,b)=>a>b?a:b) + 2,
+              // Essential: Keep Y-Axis dynamic range small for "Zoomed In" effect (Old Logic)
+              minY: _chartData.reduce((a, b) => a < b ? a : b) - 2,
+              maxY: _chartData.reduce((a, b) => a > b ? a : b) + 2,
             ),
-          ) : Container(),
+          )
+              : Center(
+            child: Text(
+              "Waiting for signal...",
+              style: TextStyle(color: Colors.white.withOpacity(0.3)),
+            ),
+          ),
         ),
       ],
     );
@@ -650,45 +875,78 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
       child: Column(
         children: [
-          const Text("ANALYSIS REPORT",
-              style: TextStyle(color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold)
+          Container(
+            padding: const EdgeInsets.all(15),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.greenAccent.withOpacity(0.2), Colors.greenAccent.withOpacity(0.05)],
+              ),
+              borderRadius: BorderRadius.circular(15),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.assessment, color: Colors.greenAccent, size: 28),
+                const SizedBox(width: 10),
+                const Text("ANALYSIS COMPLETE", style: TextStyle(color: Colors.greenAccent, fontSize: 20, fontWeight: FontWeight.bold, letterSpacing: 1)),
+              ],
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 25),
           GridView.count(
             shrinkWrap: true,
             crossAxisCount: 2,
-            childAspectRatio: 1.4,
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
+            childAspectRatio: 1.3,
+            crossAxisSpacing: 12,
+            mainAxisSpacing: 12,
             physics: const NeverScrollableScrollPhysics(),
             children: [
-              _buildMetricCard("Avg BPM", "$_displayBpm", "BPM", Colors.redAccent),
-              _buildMetricCard("SDNN", metrics['sdnn']!.toStringAsFixed(1), "ms", Colors.blueAccent),
-              _buildMetricCard("RMSSD", metrics['rmssd']!.toStringAsFixed(1), "ms", Colors.orangeAccent),
-              _buildMetricCard("pNN50", metrics['pnn50']!.toStringAsFixed(1), "%", Colors.purpleAccent),
-              _buildMetricCard("MxDMn", metrics['mxdmn']!.toStringAsFixed(0), "ms", Colors.tealAccent),
-              _buildMetricCard("AMo50", metrics['amo50']!.toStringAsFixed(1), "%", Colors.amberAccent),
+              _buildMetricCard("Avg BPM", "$_displayBpm", "BPM", Colors.redAccent, Icons.favorite),
+              _buildMetricCard("SDNN", metrics['sdnn']!.toStringAsFixed(1), "ms", Colors.blueAccent, Icons.show_chart),
+              _buildMetricCard("RMSSD", metrics['rmssd']!.toStringAsFixed(1), "ms", Colors.orangeAccent, Icons.graphic_eq),
+              _buildMetricCard("pNN50", metrics['pnn50']!.toStringAsFixed(1), "%", Colors.purpleAccent, Icons.analytics),
+              _buildMetricCard("MxDMn", metrics['mxdmn']!.toStringAsFixed(0), "ms", Colors.tealAccent, Icons.swap_vert),
+              _buildMetricCard("AMo50", metrics['amo50']!.toStringAsFixed(1), "%", Colors.amberAccent, Icons.pie_chart),
             ],
           ),
           const SizedBox(height: 20),
-          Text("Total Beats: ${_rrIntervalsHighPrecision.length}",
-              style: const TextStyle(color: Colors.white38)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            decoration: BoxDecoration(color: Colors.white.withOpacity(0.05), borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.white.withOpacity(0.1))),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.monitor_heart, color: Colors.white54, size: 20),
+                const SizedBox(width: 10),
+                Text("Total Heartbeats: ${_rrIntervalsHighPrecision.length}", style: const TextStyle(color: Colors.white70, fontSize: 15, fontWeight: FontWeight.w500)),
+              ],
+            ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 30),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               OutlinedButton.icon(
                 onPressed: _resetApp,
                 icon: const Icon(Icons.refresh, color: Colors.white),
-                label: const Text("Retry", style: TextStyle(color: Colors.white)),
+                label: const Text("New Test", style: TextStyle(color: Colors.white)),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
+                  side: const BorderSide(color: Colors.white54),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+                ),
               ),
               const SizedBox(width: 15),
               ElevatedButton.icon(
                 onPressed: _copyResults,
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blueAccent,
+                  padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+                  elevation: 5,
+                ),
                 icon: const Icon(Icons.copy, color: Colors.white),
-                label: const Text("Copy", style: TextStyle(color: Colors.white)),
+                label: const Text("Copy Results", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               ),
             ],
           ),
@@ -698,25 +956,36 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
     );
   }
 
-  Widget _buildMetricCard(String title, String value, String unit, Color color) {
+  Widget _buildMetricCard(String title, String value, String unit, Color color, IconData icon) {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.3)),
+        gradient: LinearGradient(
+          colors: [color.withOpacity(0.15), color.withOpacity(0.05)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: color.withOpacity(0.3), width: 1.5),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(title, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-          const SizedBox(height: 4),
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(value, style: TextStyle(color: color, fontSize: 24, fontWeight: FontWeight.bold)),
+              Text(title, style: const TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.w500)),
+              Icon(icon, color: color.withOpacity(0.5), size: 18),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Flexible(child: Text(value, style: TextStyle(color: color, fontSize: 26, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis)),
               const SizedBox(width: 4),
-              Text(unit, style: const TextStyle(color: Colors.white38, fontSize: 12)),
+              Padding(padding: const EdgeInsets.only(bottom: 3), child: Text(unit, style: const TextStyle(color: Colors.white38, fontSize: 12))),
             ],
           ),
         ],
