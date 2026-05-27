@@ -7,19 +7,42 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-void main() {
+import 'models/user_profile.dart';
+import 'ui/onboarding_page.dart';
+import 'utils/benchmark_utils.dart';
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-  runApp(const MaterialApp(
+  final profile = await UserProfile.loadProfile();
+  
+  runApp(MaterialApp(
     debugShowCheckedModeBanner: false,
-    home: HRVProfessionalPage(),
+    home: profile == null ? OnboardingWrapper() : HRVProfessionalPage(profile: profile),
   ));
+}
+
+class OnboardingWrapper extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return OnboardingPage(
+      onCompleted: () async {
+        final profile = await UserProfile.loadProfile();
+        if (profile != null) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => HRVProfessionalPage(profile: profile)),
+          );
+        }
+      },
+    );
+  }
 }
 
 enum AppState { idle, measuring, result }
 
 class HRVProfessionalPage extends StatefulWidget {
-  const HRVProfessionalPage({super.key});
+  final UserProfile profile;
+  const HRVProfessionalPage({super.key, required this.profile});
   @override
   State<HRVProfessionalPage> createState() => _HRVProfessionalPageState();
 }
@@ -42,6 +65,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
   final List<double> _rrIntervalsHighPrecision = [];
   final List<int> _bpmBuffer = [];
   int _displayBpm = 0;
+  late UserProfile _currentProfile;
 
   // --- DSP VARIABLES ---
   final List<double> _rawSignalBuffer = [];
@@ -59,6 +83,7 @@ class _HRVProfessionalPageState extends State<HRVProfessionalPage> with WidgetsB
   @override
   void initState() {
     super.initState();
+    _currentProfile = widget.profile;
     WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
     _initializeCamera();
@@ -512,7 +537,24 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
         children: [
           Row(
             children: [
-              // 1. Logo (No Back Button here)
+              // 1. Settings Button
+              IconButton(
+                icon: const Icon(Icons.settings, color: Colors.white70),
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => OnboardingPage(
+                      initialProfile: _currentProfile,
+                      onCompleted: () async {
+                        final updated = await UserProfile.loadProfile();
+                        if (updated != null) {
+                          setState(() => _currentProfile = updated);
+                        }
+                        Navigator.pop(context);
+                      },
+                    ))
+                  );
+                },
+              ),
               Container(
                 width: 40,
                 height: 40,
@@ -524,6 +566,7 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
                 child: Image.asset(
                   'assets/images/logo.png',
                   fit: BoxFit.contain,
+                  errorBuilder: (c, e, s) => const Icon(Icons.favorite, color: Colors.redAccent),
                 ),
               ),
               const SizedBox(width: 12),
@@ -871,6 +914,9 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
 
   Widget _buildResultView() {
     var metrics = _calculateHRVMetrics();
+    var hrBenchmark = BenchmarkUtils.evaluateHeartRate(_displayBpm, _currentProfile);
+    var hrvBenchmark = BenchmarkUtils.evaluateHRV(metrics['sdnn'] ?? 0, _currentProfile);
+
     return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
       child: Column(
@@ -909,6 +955,15 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
               _buildMetricCard("AMo50", metrics['amo50']!.toStringAsFixed(1), "%", Colors.amberAccent, Icons.pie_chart),
             ],
           ),
+          const SizedBox(height: 25),
+          
+          // Benchmark Insights
+          const Align(alignment: Alignment.centerLeft, child: Text("PERSONAL INSIGHTS", style: TextStyle(color: Colors.white70, fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1))),
+          const SizedBox(height: 10),
+          _buildBenchmarkCard(hrBenchmark, Colors.redAccent),
+          const SizedBox(height: 12),
+          _buildBenchmarkCard(hrvBenchmark, Colors.blueAccent),
+
           const SizedBox(height: 20),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -987,6 +1042,43 @@ AMo50: ${metrics['amo50']!.toStringAsFixed(1)} %
               const SizedBox(width: 4),
               Padding(padding: const EdgeInsets.only(bottom: 3), child: Text(unit, style: const TextStyle(color: Colors.white38, fontSize: 12))),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBenchmarkCard(BenchmarkResult result, Color color) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(result.title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(color: color.withOpacity(0.2), borderRadius: BorderRadius.circular(10)),
+                child: Text(result.level, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(result.description, style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4)),
+          const SizedBox(height: 12),
+          LinearProgressIndicator(
+            value: result.scoreRatio,
+            backgroundColor: Colors.white10,
+            color: color,
+            minHeight: 6,
+            borderRadius: BorderRadius.circular(3),
           ),
         ],
       ),
